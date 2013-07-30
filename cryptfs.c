@@ -38,8 +38,10 @@
 #include <cutils/android_reboot.h>
 #include <ext4.h>
 #include <linux/kdev_t.h>
+#include <fs_mgr.h>
 #include "cryptfs.h"
 #define LOG_TAG "Cryptfs"
+#include "cutils/android_reboot.h"
 #include "cutils/log.h"
 #include "cutils/properties.h"
 #include "hardware_legacy/power.h"
@@ -52,11 +54,12 @@
 #define KEY_LEN_BYTES 16
 #define IV_LEN_BYTES 16
 
-#define KEY_LOC_PROP   "ro.crypto.keyfile.userdata"
 #define KEY_IN_FOOTER  "footer"
 
 #define EXT4_FS 1
 #define FAT_FS 2
+
+#define TABLE_LOAD_RETRIES 10
 
 char *me = "cryptfs";
 
@@ -64,6 +67,8 @@ static unsigned char saved_master_key[KEY_LEN_BYTES];
 static char *saved_data_blkdev;
 static char *saved_mount_point;
 static int  master_key_saved = 0;
+#define FSTAB_PREFIX "/fstab."
+static char fstab_filename[PROPERTY_VALUE_MAX + sizeof(FSTAB_PREFIX)];
 
 static void ioctl_init(struct dm_ioctl *io, size_t dataSize, const char *name, unsigned flags)
 {
@@ -121,6 +126,19 @@ static unsigned int get_blkdev_size(int fd)
   return nr_sec;
 }
 
+/* Get and cache the name of the fstab file so we don't
+ * keep talking over the socket to the property service.
+ */
+static char *get_fstab_filename(void)
+{
+    if (fstab_filename[0] == 0) {
+        strcpy(fstab_filename, FSTAB_PREFIX);
+        property_get("ro.hardware", fstab_filename + sizeof(FSTAB_PREFIX) - 1, "");
+    }
+
+    return fstab_filename;
+}
+
 /* key or salt can be NULL, in which case just skip writing that value.  Useful to
  * update the failed mount count but not change the key.
  */
@@ -135,7 +153,7 @@ static int put_crypt_ftr_and_key(char *real_blk_name, struct crypt_mnt_ftr *cryp
   char key_loc[PROPERTY_VALUE_MAX];
   struct stat statbuf;
 
-  property_get(KEY_LOC_PROP, key_loc, KEY_IN_FOOTER);
+  fs_mgr_get_crypt_info(get_fstab_filename(), key_loc, 0, sizeof(key_loc));
 
   if (!strcmp(key_loc, KEY_IN_FOOTER)) {
     fname = real_blk_name;
@@ -166,7 +184,7 @@ static int put_crypt_ftr_and_key(char *real_blk_name, struct crypt_mnt_ftr *cryp
       return -1;
     }
   } else {
-    SLOGE("Unexpected value for" KEY_LOC_PROP "\n");
+    SLOGE("Unexpected value for crypto key location\n");
     return -1;;
   }
 
@@ -234,7 +252,7 @@ static int get_crypt_ftr_and_key(char *real_blk_name, struct crypt_mnt_ftr *cryp
   char *fname;
   struct stat statbuf;
 
-  property_get(KEY_LOC_PROP, key_loc, KEY_IN_FOOTER);
+  fs_mgr_get_crypt_info(get_fstab_filename(), key_loc, 0, sizeof(key_loc));
 
   if (!strcmp(key_loc, KEY_IN_FOOTER)) {
     fname = real_blk_name;
@@ -272,7 +290,7 @@ static int get_crypt_ftr_and_key(char *real_blk_name, struct crypt_mnt_ftr *cryp
       goto errout;
     }
   } else {
-    SLOGE("Unexpected value for" KEY_LOC_PROP "\n");
+    SLOGE("Unexpected value for crypto key location\n");
     return -1;;
   }
 
@@ -369,6 +387,7 @@ static int create_crypto_blk_dev(struct crypt_mnt_ftr *crypt_ftr, unsigned char 
   struct dm_target_spec *tgt;
   unsigned int minor;
   int fd;
+  int i;
   int retval = -1;
 
   if ((fd = open("/dev/device-mapper", O_RDWR)) < 0 ) {
@@ -411,9 +430,18 @@ static int create_crypto_blk_dev(struct crypt_mnt_ftr *crypt_ftr, unsigned char 
   crypt_params = (char *) (((unsigned long)crypt_params + 7) & ~8); /* Align to an 8 byte boundary */
   tgt->next = crypt_params - buffer;
 
-  if (ioctl(fd, DM_TABLE_LOAD, io)) {
+  for (i = 0; i < TABLE_LOAD_RETRIES; i++) {
+    if (! ioctl(fd, DM_TABLE_LOAD, io)) {
+      break;
+    }
+    usleep(500000);
+  }
+
+  if (i == TABLE_LOAD_RETRIES) {
       SLOGE("Cannot load dm-crypt mapping table.\n");
       goto errout;
+  } else if (i) {
+      SLOGI("Took %d tries to load dmcrypt table.\n", i + 1);
   }
 
   /* Resume this device to activate it */
@@ -556,27 +584,6 @@ static int create_encrypted_random_key(char *passwd, unsigned char *master_key, 
     return encrypt_master_key(passwd, salt, key_buf, master_key);
 }
 
-static int get_orig_mount_parms(char *mount_point, char *fs_type, char *real_blkdev,
-                                unsigned long *mnt_flags, char *fs_options)
-{
-  char mount_point2[PROPERTY_VALUE_MAX];
-  char fs_flags[PROPERTY_VALUE_MAX];
-
-  property_get("ro.crypto.fs_type", fs_type, "");
-  property_get("ro.crypto.fs_real_blkdev", real_blkdev, "");
-  property_get("ro.crypto.fs_mnt_point", mount_point2, "");
-  property_get("ro.crypto.fs_options", fs_options, "");
-  property_get("ro.crypto.fs_flags", fs_flags, "");
-  *mnt_flags = strtol(fs_flags, 0, 0);
-
-  if (strcmp(mount_point, mount_point2)) {
-    /* Consistency check.  These should match. If not, something odd happened. */
-    return -1;
-  }
-
-  return 0;
-}
-
 static int wait_and_unmount(char *mountpoint)
 {
     int i, rc;
@@ -681,6 +688,13 @@ int cryptfs_restart(void)
     property_set("vold.decrypt", "trigger_reset_main");
     SLOGD("Just asked init to shut down class main\n");
 
+    /* Ugh, shutting down the framework is not synchronous, so until it
+     * can be fixed, this horrible hack will wait a moment for it all to
+     * shut down before proceeding.  Without it, some devices cannot
+     * restart the graphics services.
+     */
+    sleep(2);
+
     /* Now that the framework is shutdown, we should be able to umount()
      * the tmpfs filesystem, and mount the real one.
      */
@@ -691,26 +705,22 @@ int cryptfs_restart(void)
         return -1;
     }
 
-    if (! get_orig_mount_parms(DATA_MNT_POINT, fs_type, real_blkdev, &mnt_flags, fs_options)) {
-        SLOGD("Just got orig mount parms\n");
+    if (! (rc = wait_and_unmount(DATA_MNT_POINT)) ) {
+        /* If that succeeded, then mount the decrypted filesystem */
+        fs_mgr_do_mount(get_fstab_filename(), DATA_MNT_POINT, crypto_blkdev, 0);
 
-        if (! (rc = wait_and_unmount(DATA_MNT_POINT)) ) {
-            /* If that succeeded, then mount the decrypted filesystem */
-            mount(crypto_blkdev, DATA_MNT_POINT, fs_type, mnt_flags, fs_options);
-
-            property_set("vold.decrypt", "trigger_load_persist_props");
-            /* Create necessary paths on /data */
-            if (prep_data_fs()) {
-                return -1;
-            }
-
-            /* startup service classes main and late_start */
-            property_set("vold.decrypt", "trigger_restart_framework");
-            SLOGD("Just triggered restart_framework\n");
-
-            /* Give it a few moments to get started */
-            sleep(1);
+        property_set("vold.decrypt", "trigger_load_persist_props");
+        /* Create necessary paths on /data */
+        if (prep_data_fs()) {
+            return -1;
         }
+
+        /* startup service classes main and late_start */
+        property_set("vold.decrypt", "trigger_restart_framework");
+        SLOGD("Just triggered restart_framework\n");
+
+        /* Give it a few moments to get started */
+        sleep(1);
     }
 
     if (rc == 0) {
@@ -726,10 +736,8 @@ static int do_crypto_complete(char *mount_point)
   unsigned char encrypted_master_key[32];
   unsigned char salt[SALT_LEN];
   char real_blkdev[MAXPATHLEN];
-  char fs_type[PROPERTY_VALUE_MAX];
-  char fs_options[PROPERTY_VALUE_MAX];
-  unsigned long mnt_flags;
   char encrypted_state[PROPERTY_VALUE_MAX];
+  char key_loc[PROPERTY_VALUE_MAX];
 
   property_get("ro.crypto.state", encrypted_state, "");
   if (strcmp(encrypted_state, "encrypted") ) {
@@ -737,14 +745,25 @@ static int do_crypto_complete(char *mount_point)
     return 1;
   }
 
-  if (get_orig_mount_parms(mount_point, fs_type, real_blkdev, &mnt_flags, fs_options)) {
-    SLOGE("Error reading original mount parms for mount point %s\n", mount_point);
-    return -1;
-  }
+  fs_mgr_get_crypt_info(get_fstab_filename(), 0, real_blkdev, sizeof(real_blkdev));
 
   if (get_crypt_ftr_and_key(real_blkdev, &crypt_ftr, encrypted_master_key, salt)) {
-    SLOGE("Error getting crypt footer and key\n");
-    return -1;
+    fs_mgr_get_crypt_info(get_fstab_filename(), key_loc, 0, sizeof(key_loc));
+
+    /*
+     * Only report this error if key_loc is a file and it exists.
+     * If the device was never encrypted, and /data is not mountable for
+     * some reason, returning 1 should prevent the UI from presenting the
+     * a "enter password" screen, or worse, a "press button to wipe the
+     * device" screen.
+     */
+    if ((key_loc[0] == '/') && (access("key_loc", F_OK) == -1)) {
+      SLOGE("master key file does not exist, aborting");
+      return 1;
+    } else {
+      SLOGE("Error getting crypt footer and key\n");
+      return -1;
+    }
   }
 
   if (crypt_ftr.flags & CRYPT_ENCRYPTION_IN_PROGRESS) {
@@ -765,10 +784,7 @@ static int test_mount_encrypted_fs(char *passwd, char *mount_point, char *label)
   unsigned char salt[SALT_LEN];
   char crypto_blkdev[MAXPATHLEN];
   char real_blkdev[MAXPATHLEN];
-  char fs_type[PROPERTY_VALUE_MAX];
-  char fs_options[PROPERTY_VALUE_MAX];
   char tmp_mount_point[64];
-  unsigned long mnt_flags;
   unsigned int orig_failed_decrypt_count;
   char encrypted_state[PROPERTY_VALUE_MAX];
   int rc;
@@ -779,10 +795,7 @@ static int test_mount_encrypted_fs(char *passwd, char *mount_point, char *label)
     return -1;
   }
 
-  if (get_orig_mount_parms(mount_point, fs_type, real_blkdev, &mnt_flags, fs_options)) {
-    SLOGE("Error reading original mount parms for mount point %s\n", mount_point);
-    return -1;
-  }
+  fs_mgr_get_crypt_info(get_fstab_filename(), 0, real_blkdev, sizeof(real_blkdev));
 
   if (get_crypt_ftr_and_key(real_blkdev, &crypt_ftr, encrypted_master_key, salt)) {
     SLOGE("Error getting crypt footer and key\n");
@@ -811,7 +824,7 @@ static int test_mount_encrypted_fs(char *passwd, char *mount_point, char *label)
    */
   sprintf(tmp_mount_point, "%s/tmp_mnt", mount_point);
   mkdir(tmp_mount_point, 0755);
-  if ( mount(crypto_blkdev, tmp_mount_point, "ext4", MS_RDONLY, "") ) {
+  if (fs_mgr_do_mount(get_fstab_filename(), DATA_MNT_POINT, crypto_blkdev, tmp_mount_point)) {
     SLOGE("Error temp mounting decrypted block device\n");
     delete_crypto_blk_dev(label);
     crypt_ftr.failed_decrypt_count++;
@@ -923,9 +936,6 @@ int cryptfs_verify_passwd(char *passwd)
     unsigned char encrypted_master_key[32], decrypted_master_key[32];
     unsigned char salt[SALT_LEN];
     char real_blkdev[MAXPATHLEN];
-    char fs_type[PROPERTY_VALUE_MAX];
-    char fs_options[PROPERTY_VALUE_MAX];
-    unsigned long mnt_flags;
     char encrypted_state[PROPERTY_VALUE_MAX];
     int rc;
 
@@ -945,10 +955,7 @@ int cryptfs_verify_passwd(char *passwd)
         return -1;
     }
 
-    if (get_orig_mount_parms(saved_mount_point, fs_type, real_blkdev, &mnt_flags, fs_options)) {
-        SLOGE("Error reading original mount parms for mount point %s\n", saved_mount_point);
-        return -1;
-    }
+    fs_mgr_get_crypt_info(get_fstab_filename(), 0, real_blkdev, sizeof(real_blkdev));
 
     if (get_crypt_ftr_and_key(real_blkdev, &crypt_ftr, encrypted_master_key, salt)) {
         SLOGE("Error getting crypt footer and key\n");
@@ -1128,9 +1135,7 @@ int cryptfs_enable(char *howarg, char *passwd)
 {
     int how = 0;
     char crypto_blkdev[MAXPATHLEN], real_blkdev[MAXPATHLEN], sd_crypto_blkdev[MAXPATHLEN];
-    char fs_type[PROPERTY_VALUE_MAX], fs_options[PROPERTY_VALUE_MAX],
-         mount_point[PROPERTY_VALUE_MAX];
-    unsigned long mnt_flags, nr_sec;
+    unsigned long nr_sec;
     unsigned char master_key[KEY_LEN_BYTES], decrypted_master_key[KEY_LEN_BYTES];
     unsigned char salt[SALT_LEN];
     int rc=-1, fd, i, ret;
@@ -1152,7 +1157,7 @@ int cryptfs_enable(char *howarg, char *passwd)
         goto error_unencrypted;
     }
 
-    property_get(KEY_LOC_PROP, key_loc, KEY_IN_FOOTER);
+    fs_mgr_get_crypt_info(get_fstab_filename(), key_loc, 0, sizeof(key_loc));
 
     if (!strcmp(howarg, "wipe")) {
       how = CRYPTO_ENABLE_WIPE;
@@ -1163,7 +1168,7 @@ int cryptfs_enable(char *howarg, char *passwd)
       goto error_unencrypted;
     }
 
-    get_orig_mount_parms(mount_point, fs_type, real_blkdev, &mnt_flags, fs_options);
+    fs_mgr_get_crypt_info(get_fstab_filename(), 0, real_blkdev, sizeof(real_blkdev));
 
     /* Get the size of the real block device */
     fd = open(real_blkdev, O_RDONLY);
@@ -1193,11 +1198,14 @@ int cryptfs_enable(char *howarg, char *passwd)
     snprintf(lockid, sizeof(lockid), "enablecrypto%d", (int) getpid());
     acquire_wake_lock(PARTIAL_WAKE_LOCK, lockid);
 
-     /* Get the sdcard mount point */
-     sd_mnt_point = getenv("EXTERNAL_STORAGE");
-     if (! sd_mnt_point) {
-         sd_mnt_point = "/mnt/sdcard";
-     }
+    /* Get the sdcard mount point */
+    sd_mnt_point = getenv("EMULATED_STORAGE_SOURCE");
+    if (!sd_mnt_point) {
+       sd_mnt_point = getenv("EXTERNAL_STORAGE");
+    }
+    if (!sd_mnt_point) {
+        sd_mnt_point = "/mnt/sdcard";
+    }
 
     num_vols=vold_getNumDirectVolumes();
     vol_list = malloc(sizeof(struct volume_info) * num_vols);
@@ -1228,6 +1236,13 @@ int cryptfs_enable(char *howarg, char *passwd)
     property_set("vold.decrypt", "trigger_shutdown_framework");
     SLOGD("Just asked init to shut down class main\n");
 
+    if (vold_unmountAllAsecs()) {
+        /* Just report the error.  If any are left mounted,
+         * umounting /data below will fail and handle the error.
+         */
+        SLOGE("Error unmounting internal asecs");
+    }
+
     property_get("ro.crypto.fuse_sdcard", fuse_sdcard, "");
     if (!strcmp(fuse_sdcard, "true")) {
         /* This is a device using the fuse layer to emulate the sdcard semantics
@@ -1252,9 +1267,7 @@ int cryptfs_enable(char *howarg, char *passwd)
          * /data, set a property saying we're doing inplace encryption,
          * and restart the framework.
          */
-        property_get("ro.crypto.tmpfs_options", tmpfs_options, "");
-        if (mount("tmpfs", DATA_MNT_POINT, "tmpfs", MS_NOATIME | MS_NOSUID | MS_NODEV,
-            tmpfs_options) < 0) {
+        if (fs_mgr_do_tmpfs_mount(DATA_MNT_POINT)) {
             goto error_shutting_down;
         }
         /* Tells the framework that inplace encryption is starting */
@@ -1265,6 +1278,13 @@ int cryptfs_enable(char *howarg, char *passwd)
         if (prep_data_fs()) {
             goto error_shutting_down;
         }
+
+        /* Ugh, shutting down the framework is not synchronous, so until it
+         * can be fixed, this horrible hack will wait a moment for it all to
+         * shut down before proceeding.  Without it, some devices cannot
+         * restart the graphics services.
+         */
+        sleep(2);
 
         /* startup service classes main and late_start */
         property_set("vold.decrypt", "trigger_restart_min_framework");
@@ -1372,8 +1392,26 @@ int cryptfs_enable(char *howarg, char *passwd)
         sleep(2); /* Give the UI a chance to show 100% progress */
         android_reboot(ANDROID_RB_RESTART, 0, 0);
     } else {
-        property_set("vold.encrypt_progress", "error_partially_encrypted");
-        release_wake_lock(lockid);
+        char value[PROPERTY_VALUE_MAX];
+
+        property_get("ro.vold.wipe_on_crypt_fail", value, "0");
+        if (!strcmp(value, "1")) {
+            /* wipe data if encryption failed */
+            SLOGE("encryption failed - rebooting into recovery to wipe data\n");
+            mkdir("/cache/recovery", 0700);
+            int fd = open("/cache/recovery/command", O_RDWR|O_CREAT|O_TRUNC, 0600);
+            if (fd >= 0) {
+                write(fd, "--wipe_data", strlen("--wipe_data") + 1);
+                close(fd);
+            } else {
+                SLOGE("could not open /cache/recovery/command\n");
+            }
+            android_reboot(ANDROID_RB_RESTART2, 0, "recovery");
+        } else {
+            /* set property to trigger dialog */
+            property_set("vold.encrypt_progress", "error_partially_encrypted");
+            release_wake_lock(lockid);
+        }
         return -1;
     }
 
@@ -1423,7 +1461,7 @@ int cryptfs_changepw(char *newpw)
         return -1;
     }
 
-    property_get("ro.crypto.fs_real_blkdev", real_blkdev, "");
+    fs_mgr_get_crypt_info(get_fstab_filename(), 0, real_blkdev, sizeof(real_blkdev));
     if (strlen(real_blkdev) == 0) {
         SLOGE("Can't find real blkdev");
         return -1;

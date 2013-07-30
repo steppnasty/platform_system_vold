@@ -69,10 +69,14 @@ const char *Volume::SEC_STGDIR        = "/mnt/secure/staging";
 const char *Volume::SEC_STG_SECIMGDIR = "/mnt/secure/staging/.android_secure";
 
 /*
- * Path to where *only* root can access asec imagefiles
+ * Path to external storage where *only* root can access ASEC image files
  */
-const char *Volume::SEC_ASECDIR       = "/mnt/secure/asec";
+const char *Volume::SEC_ASECDIR_EXT   = "/mnt/secure/asec";
 
+/*
+ * Path to internal storage where *only* root can access ASEC image files
+ */
+const char *Volume::SEC_ASECDIR_INT   = "/data/app-asec";
 /*
  * Path to where secure containers are mounted
  */
@@ -166,11 +170,6 @@ int Volume::handleBlockEvent(NetlinkEvent *evt) {
     return -1;
 }
 
-bool Volume::isPrimaryStorage() {
-    const char* externalStorage = getenv("EXTERNAL_STORAGE") ? : "/mnt/sdcard";
-    return !strcmp(getMountpoint(), externalStorage);
-}
-
 void Volume::setState(int state) {
     char msg[255];
     int oldState = mState;
@@ -248,15 +247,6 @@ int Volume::formatVol() {
     sprintf(devicePath, "/dev/block/vold/%d:%d",
             MAJOR(partNode), MINOR(partNode));
 
-#ifdef VOLD_EMMC_SHARES_DEV_MAJOR
-    // If emmc and sdcard share dev major number, vold may pick
-    // incorrectly based on partition nodes alone, formatting
-    // the wrong device. Use device nodes instead.
-    dev_t deviceNodes;
-    getDeviceNodes((dev_t *) &deviceNodes, 1);
-    sprintf(devicePath, "/dev/block/vold/%d:%d", MAJOR(deviceNodes), MINOR(deviceNodes));
-#endif
-
     if (mDebug) {
         SLOGI("Formatting volume %s (%s)", getLabel(), devicePath);
     }
@@ -303,7 +293,8 @@ int Volume::mountVol() {
     dev_t deviceNodes[4];
     int n, i, rc = 0;
     char errmsg[255];
-    bool primaryStorage = isPrimaryStorage();
+    const char* externalStorage = getenv("EXTERNAL_STORAGE");
+    bool primaryStorage = externalStorage && !strcmp(getMountpoint(), externalStorage);
     char decrypt_state[PROPERTY_VALUE_MAX];
     char crypto_state[PROPERTY_VALUE_MAX];
     char encrypt_progress[PROPERTY_VALUE_MAX];
@@ -426,10 +417,14 @@ int Volume::mountVol() {
         errno = 0;
         int gid;
 
-        // Originally, non-primary storage was set to MEDIA_RW group which
-        // prevented users from writing to it. We don't want that.
-        gid = AID_SDCARD_RW;
-
+        if (primaryStorage) {
+            // Special case the primary SD card.
+            // For this we grant write access to the SDCARD_RW group.
+            gid = AID_SDCARD_RW;
+        } else {
+            // For secondary external storage we keep things locked up.
+            gid = AID_MEDIA_RW;
+        }
         if (Fat::doMount(devicePath, "/mnt/secure/staging", false, false, false,
                 AID_SYSTEM, gid, 0702, true)) {
             SLOGE("%s failed to mount via VFAT (%s)\n", devicePath, strerror(errno));
@@ -513,9 +508,9 @@ int Volume::createBindMounts() {
      * Bind mount /mnt/secure/staging/android_secure -> /mnt/secure/asec so we'll
      * have a root only accessable mountpoint for it.
      */
-    if (mount(SEC_STG_SECIMGDIR, SEC_ASECDIR, "", MS_BIND, NULL)) {
+    if (mount(SEC_STG_SECIMGDIR, SEC_ASECDIR_EXT, "", MS_BIND, NULL)) {
         SLOGE("Failed to bind mount points %s -> %s (%s)",
-                SEC_STG_SECIMGDIR, SEC_ASECDIR, strerror(errno));
+                SEC_STG_SECIMGDIR, SEC_ASECDIR_EXT, strerror(errno));
         return -1;
     }
 
@@ -602,7 +597,6 @@ int Volume::doUnmount(const char *path, bool force) {
 
 int Volume::unmountVol(bool force, bool revert) {
     int i, rc;
-    const char* externalStorage = getenv("EXTERNAL_STORAGE");
 
     if (getState() != Volume::State_Mounted) {
         SLOGE("Volume %s unmount request when not mounted", getLabel());
@@ -614,44 +608,29 @@ int Volume::unmountVol(bool force, bool revert) {
     usleep(1000 * 1000); // Give the framework some time to react
 
     /*
-     * First move the mountpoint back to our internal staging point
-     * so nobody else can muck with it while we work.
+     * Remove the bindmount we were using to keep a reference to
+     * the previously obscured directory.
      */
-    if (doMoveMount(getMountpoint(), SEC_STGDIR, force)) {
-        SLOGE("Failed to move mount %s => %s (%s)", getMountpoint(), SEC_STGDIR, strerror(errno));
-        setState(Volume::State_Mounted);
-        return -1;
+    if (doUnmount(Volume::SEC_ASECDIR_EXT, force)) {
+        SLOGE("Failed to remove bindmount on %s (%s)", SEC_ASECDIR_EXT, strerror(errno));
+        goto fail_remount_tmpfs;
     }
 
-    protectFromAutorunStupidity();
-
-    /* Undo createBindMounts(), which is only called for primary storage */
-    if (isPrimaryStorage()) {
-        /*
-         * Unmount the tmpfs which was obscuring the asec image directory
-         * from non root users
-         */
-
-        if (doUnmount(Volume::SEC_STG_SECIMGDIR, force)) {
-            SLOGE("Failed to unmount tmpfs on %s (%s)", SEC_STG_SECIMGDIR, strerror(errno));
-            goto fail_republish;
-        }
-
-        /*
-         * Remove the bindmount we were using to keep a reference to
-         * the previously obscured directory.
-         */
-
-        if (doUnmount(Volume::SEC_ASECDIR, force)) {
-            SLOGE("Failed to remove bindmount on %s (%s)", SEC_ASECDIR, strerror(errno));
-            goto fail_remount_tmpfs;
-        }
+    /*
+     * Unmount the tmpfs which was obscuring the asec image directory
+     * from non root users
+     */
+    char secure_dir[PATH_MAX];
+    snprintf(secure_dir, PATH_MAX, "%s/.android_secure", getMountpoint());
+    if (doUnmount(secure_dir, force)) {
+        SLOGE("Failed to unmount tmpfs on %s (%s)", secure_dir, strerror(errno));
+        goto fail_republish;
     }
 
     /*
      * Finally, unmount the actual block device from the staging dir
      */
-    if (doUnmount(Volume::SEC_STGDIR, force)) {
+    if (doUnmount(getMountpoint(), force)) {
         SLOGE("Failed to unmount %s (%s)", SEC_STGDIR, strerror(errno));
         goto fail_recreate_bindmount;
     }
@@ -676,7 +655,7 @@ int Volume::unmountVol(bool force, bool revert) {
      * Failure handling - try to restore everything back the way it was
      */
 fail_recreate_bindmount:
-    if (mount(SEC_STG_SECIMGDIR, SEC_ASECDIR, "", MS_BIND, NULL)) {
+    if (mount(SEC_STG_SECIMGDIR, SEC_ASECDIR_EXT, "", MS_BIND, NULL)) {
         SLOGE("Failed to restore bindmount after failure! - Storage will appear offline!");
         goto out_nomedia;
     }

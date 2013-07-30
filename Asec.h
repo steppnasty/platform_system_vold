@@ -33,6 +33,7 @@ struct asec_superblock {
     unsigned char c_chain;
 
 #define ASEC_SB_C_OPTS_NONE 0
+#define ASEC_SB_C_OPTS_EXT4 1
     unsigned char c_opts;
 
 #define ASEC_SB_C_MODE_NONE 0
