@@ -49,7 +49,8 @@
 #include "Asec.h"
 #include "cryptfs.h"
 
-#define MASS_STORAGE_FILE_PATH  "/sys/class/android_usb/android0/f_mass_storage/lun/file"
+/* TODO: implement a check for legacy support and include newer driver support */
+#define MASS_STORAGE_FILE_PATH  "/sys/device/platform/usb_mass_storage/lun0/file"
 
 VolumeManager *VolumeManager::sInstance = NULL;
 
