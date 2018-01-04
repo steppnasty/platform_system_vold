@@ -50,7 +50,7 @@
 #include "cryptfs.h"
 
 /* TODO: implement a check for legacy support and include newer driver support */
-#define MASS_STORAGE_FILE_PATH  "/sys/devices/platform/usb_mass_storage/lun0/file"
+#define MASS_STORAGE_FILE_PATH  "/sys/device/platform/usb_mass_storage/lun0/file"
 
 VolumeManager *VolumeManager::sInstance = NULL;
 
