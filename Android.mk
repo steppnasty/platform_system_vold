@@ -21,8 +21,7 @@ common_src_files := \
 common_c_includes := \
 	$(KERNEL_HEADERS) \
 	system/extras/ext4_utils \
-	external/openssl/include \
-	system/core/fs_mgr/include
+	external/openssl/include
 
 common_shared_libraries := \
 	libsysutils \
